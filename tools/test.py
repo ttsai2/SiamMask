@@ -16,16 +16,16 @@ from utils.log_helper import init_log, add_file_handler
 from utils.load_helper import load_pretrain
 from utils.bbox_helper import get_axis_aligned_bbox, cxy_wh_2_rect
 from utils.benchmark_helper import load_dataset, dataset_zoo
-
+import glob
 import torch
 from torch.autograd import Variable
 import torch.nn.functional as F
-
+from tqdm import tqdm
 import models
-
+import moviepy.editor as mpe
 from utils.anchors import Anchors
 from utils.tracker_config import TrackerConfig
-
+import colorsys
 from utils.config_helper import load_config
 from utils.pyvotkit.region import vot_overlap, vot_float2str
 
@@ -44,7 +44,7 @@ parser.add_argument('--resume', default='', type=str, required=True,
                     metavar='PATH',help='path to latest checkpoint (default: none)')
 parser.add_argument('--mask', action='store_true', help='whether use mask output')
 parser.add_argument('--refine', action='store_true', help='whether use mask refine output')
-parser.add_argument('--dataset', dest='dataset', default='VOT2018', choices=dataset_zoo,
+parser.add_argument('--dataset', dest='dataset', default='VOT2018', 
                     help='datasets')
 parser.add_argument('-l', '--log', default="log_test.txt", type=str, help='log file')
 parser.add_argument('-v', '--visualization', dest='visualization', action='store_true',
@@ -52,6 +52,34 @@ parser.add_argument('-v', '--visualization', dest='visualization', action='store
 parser.add_argument('--save_mask', action='store_true', help='whether use save mask for davis')
 parser.add_argument('--gt', action='store_true', help='whether use gt rect for davis (Oracle)')
 
+def create_unique_color_float(tag, hue_step=0.41):
+    h, v = (tag * hue_step) % 1, 1. - (int(tag * hue_step) % 4) / 5.
+    r, g, b = colorsys.hsv_to_rgb(h, 1., v)
+    return r, g, b
+
+def create_unique_color_uchar(tag, hue_step=0.41):
+    r, g, b = create_unique_color_float(tag, hue_step)
+    return int(255 * r), int(255 * g), int(255 * b)
+
+def draw_rectangle(image, color, min_x, min_y, max_x, max_y, thickness=2, label=None):
+    pt1 = int(min_x), int(min_y)
+    pt2 = int(max_x), int(max_y)
+    cv2.rectangle(image, pt1, pt2, color, thickness)
+    if label is not None:
+        text_size = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_PLAIN, 1, thickness)
+
+        center = pt1[0] + 5, pt1[1] + 5 + text_size[0][1]
+        pt2 = pt1[0] + 10 + text_size[0][0], pt1[1] + 10 + \
+            text_size[0][1]
+        cv2.rectangle(image, pt1, pt2, color, -1)
+        cv2.putText(image, label, center, cv2.FONT_HERSHEY_PLAIN,
+                    1, (255, 255, 255), thickness)
+
+def bbox1(img):
+    a = np.where(img != 0)
+    bbox = np.min(a[1]), np.min(a[0]), np.max(a[1]), np.max(a[0])
+    return bbox
 
 def to_torch(ndarray):
     if type(ndarray).__module__ == 'numpy':
@@ -193,7 +221,6 @@ def siamese_track(state, im, mask_enable=False, refine_enable=False):
 
     # extract scaled crops for search region x at previous target position
     x_crop = Variable(get_subwindow_tracking(im, target_pos, p.instance_size, round(s_x), avg_chans).unsqueeze(0))
-
     if mask_enable:
         score, delta, mask = net.track_mask(x_crop.cuda())
     else:
@@ -309,6 +336,9 @@ def siamese_track(state, im, mask_enable=False, refine_enable=False):
     state['score'] = score
     state['mask'] = mask_in_img if mask_enable else []
     state['ploygon'] = rbox_in_img if mask_enable else []
+    state['best_pscore'] = score[best_pscore_id]
+    bbox = bbox1(target_mask)
+    state['bbox'] = bbox
     return state
 
 
@@ -452,90 +482,198 @@ def MultiBatchIouMeter(thrs, outputs, targets, start=None, end=None):
     return res
 
 
-def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot_enable=False):
-    image_files = video['image_files']
-
-    annos = [np.array(Image.open(x)) for x in video['anno_files']]
-    if 'anno_init_files' in video:
-        annos_init = [np.array(Image.open(x)) for x in video['anno_init_files']]
+def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot_enable=False, is_av=False):
+    if is_av:
+        start_image_name = {
+            1: '1539644288208_2e0c2683ca37b7bc60a73ed4a5e56c07.jpeg',
+            2: '1539644288208_2e0c2683ca37b7bc60a73ed4a5e56c07.jpeg',
+            3: '1539644288208_2e0c2683ca37b7bc60a73ed4a5e56c07.jpeg',
+            7: '1539644288208_2e0c2683ca37b7bc60a73ed4a5e56c07.jpeg',
+            8: '1539644288306_fe57e9c4532ef666a09e3f739f5a5453.jpeg',
+            11: '1539644288506_9eb46d04b55095cf1e46e284ebd9dc74.jpeg',
+            15: '1539644288806_a60c70392fe388ba65149af1f05c82f1.jpeg',
+            25: '1539644289508_bf85b246ffb2b5422daf92b198b4962f.jpeg',
+            31: '1539644290307_c887872be7aad089acd43d379522b2e0.jpeg',
+            36: '1539644290707_e82a8e9bc300ed70ba295209fa630b18.jpeg',
+            46: '1539644291205_4c93de9a25a05ad66a2c56acdba2a597.jpeg',
+            64: '1539644292205_5dd64ec5619d051218fb9ef5d0dc66c5.jpeg',
+            70: '1539644292806_a6c3f0e2227a7aa69121e0fa2d9c8204.jpeg',
+            81: '1539644295609_a2d13da21de24aa67e2937e9d6e9d578.jpeg',
+            85: '1539644297208_c86e5aa24eeb1bd019a9b8ccadd20391.jpeg',
+            88: '1539644297906_6ef4e56500f601420d9378a93fb82702.jpeg',
+            95: '1539644300108_4634964ecba62e723641a86e9d6acbca.jpeg',
+            98: '1539644301204_39be9d8c63f655563163d53077b31ee6.jpeg',
+            102: '1539644302106_67579806270edff237d28babe618f1c1.jpeg'
+        }
+#         end_image_name = {
+#             1: '1539644303205_af37301f17a8339c9e7d9a23840e43ce.jpeg',
+#             2: '1539644303107_7966554f2bdabc5e829d724f2c2b196c.jpeg',
+#             3: '1539644290407_e2f74e04fb17ce283b8a0a8cff9ea1de.jpeg',
+#             7: '1539644302304_20bf85e62420d22f70f02e3dad4d01bb.jpeg'
+#         }
+        video = {'name': 'av_15s', 'start_image_name': start_image_name}
+        image_files = sorted(glob.glob('/mnt/user-home/SiamMask/experiments/siammask/av_data/images/*.jpeg'))
+        image_names = list(map(lambda x : x.split('/')[-1], image_files))
+        image_names_dict = {}
+        i = 0
+        for image_name in image_names:
+            image_names_dict[image_name] = i
+            i += 1
+        object_ids = [1,2,3,7,8,11,15,25,31,36,46,64,70,81,85,88,95,98,102]
+        object_num = len(object_ids)
+        pred_masks = np.zeros((object_num, len(image_files), 1024, 1224)) - 1
+        init_bbox = [[488, 552, 551, 596], [716, 549, 820, 625], [320, 557, 359, 584], [680, 543, 737, 594], [573, 547, 612, 573],[717, 545, 796, 607], [481, 540, 546, 567], [237, 549, 304, 575], [39, 518, 189, 579], [755, 536, 824, 562], [824, 532, 836, 569], [928, 527, 954, 593], [1051, 527, 1098, 638], [5, 555, 269, 855], [462, 541, 505, 568], [236, 551, 308, 588], [90, 556, 214, 606], [423, 547, 477, 577], [1186, 512, 1223, 675]]
     else:
-        annos_init = [annos[0]]
+        image_files = video['image_files']
 
-    if not mot_enable:
-        annos = [(anno > 0).astype(np.uint8) for anno in annos]
-        annos_init = [(anno_init > 0).astype(np.uint8) for anno_init in annos_init]
+        annos = [np.array(Image.open(x)) for x in video['anno_files']]
+        if 'anno_init_files' in video:
+            annos_init = [np.array(Image.open(x)) for x in video['anno_init_files']]
+        else:
+            annos_init = [annos[0]]
 
-    if 'start_frame' in video:
-        object_ids = [int(id) for id in video['start_frame']]
-    else:
-        object_ids = [o_id for o_id in np.unique(annos[0]) if o_id != 0]
-        if len(object_ids) != len(annos_init):
-            annos_init = annos_init*len(object_ids)
-    object_num = len(object_ids)
+        if not mot_enable:
+            annos = [(anno > 0).astype(np.uint8) for anno in annos]
+            annos_init = [(anno_init > 0).astype(np.uint8) for anno_init in annos_init]
+
+        if 'start_frame' in video:
+            object_ids = [int(id) for id in video['start_frame']]
+        else:
+            object_ids = [o_id for o_id in np.unique(annos[0]) if o_id != 0]
+            if len(object_ids) != len(annos_init):
+                annos_init = annos_init * len(object_ids)
+        object_num = len(object_ids)
+        pred_masks = np.zeros((object_num, len(image_files), annos[0].shape[0], annos[0].shape[1])) - 1
+
     toc = 0
-    pred_masks = np.zeros((object_num, len(image_files), annos[0].shape[0], annos[0].shape[1]))-1
+    locations_objs = []
     for obj_id, o_id in enumerate(object_ids):
-
+        mask = None
+        locations = {}
+        locations_objs.append((o_id, locations))
         if 'start_frame' in video:
             start_frame = video['start_frame'][str(o_id)]
             end_frame = video['end_frame'][str(o_id)]
+        elif 'start_image_name' in video:
+            start_image_name = video['start_image_name'][o_id]
+#             end_image_name = video['end_image_name'][o_id]
+            start_frame = image_names_dict[start_image_name]
+#             end_frame = image_names_dict[end_image_name]
+            end_frame = len(image_files)
         else:
             start_frame, end_frame = 0, len(image_files)
 
+        track_stop = False
         for f, image_file in enumerate(image_files):
-            im = cv2.imread(image_file)
             tic = cv2.getTickCount()
             if f == start_frame:  # init
-                mask = annos_init[obj_id] == o_id
-                x, y, w, h = cv2.boundingRect((mask).astype(np.uint8))
-                cx, cy = x + w/2, y + h/2
-                target_pos = np.array([cx, cy])
-                target_sz = np.array([w, h])
-                state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
+                im = cv2.imread(image_file)
+                if is_av:
+                    bbox = init_bbox[obj_id]
+                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    target_pos = np.array([cx, cy])
+                    target_sz = np.array([w, h])
+                    state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
+                else:
+                    mask = annos_init[obj_id] == o_id
+                    x, y, w, h = cv2.boundingRect((mask).astype(np.uint8))
+                    cx, cy = x + w / 2, y + h / 2
+                    target_pos = np.array([cx, cy])
+                    target_sz = np.array([w, h])
+                    state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
+                    #                 location = state['ploygon'].flatten()
             elif end_frame >= f > start_frame:  # tracking
-                state = siamese_track(state, im, mask_enable, refine_enable)  # track
-                mask = state['mask']
+                if not track_stop:
+                    im = cv2.imread(image_file)
+                    state = siamese_track(state, im, mask_enable, refine_enable)  # track
+                    mask = state['mask']
+                    if state['best_pscore'] < .80:
+                        print("track: {} stops at frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
+                        track_stop = True
+                    else:
+                        print("track: {}, frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
+                        # location = state['ploygon'].flatten()
+                        # locations[f] = location
+                        locations[f] = state['bbox']
             toc += cv2.getTickCount() - tic
-            if end_frame >= f >= start_frame:
+            if end_frame >= f > start_frame and not track_stop:
                 pred_masks[obj_id, f, :, :] = mask
     toc /= cv2.getTickFrequency()
 
-    if len(annos) == len(image_files):
-        multi_mean_iou = MultiBatchIouMeter(thrs, pred_masks, annos,
-                                            start=video['start_frame'] if 'start_frame' in video else None,
-                                            end=video['end_frame'] if 'end_frame' in video else None)
-        for i in range(object_num):
-            for j, thr in enumerate(thrs):
-                logger.info('Fusion Multi Object{:20s} IOU at {:.2f}: {:.4f}'.format(video['name'] + '_' + str(i + 1), thr,
-                                                                           multi_mean_iou[i, j]))
-    else:
-        multi_mean_iou = []
+#     if len(annos) == len(image_files):
+#         multi_mean_iou = MultiBatchIouMeter(thrs, pred_masks, annos,
+#                                             start=video['start_frame'] if 'start_frame' in video else None,
+#                                             end=video['end_frame'] if 'end_frame' in video else None)
+#         for i in range(object_num):
+#             for j, thr in enumerate(thrs):
+#                 logger.info('Fusion Multi Object{:20s} IOU at {:.2f}: {:.4f}'.format(video['name'] + '_' + str(i + 1), thr,
+#                                                         multi_mean_iou[i, j]))
+#     else:
+#         multi_mean_iou = []
+    multi_mean_iou = []
 
-    if args.save_mask:
-        video_path = join('test', args.dataset, 'SiamMask', video['name'])
+    # if False:
+    #     video_path = join('test', args.dataset, 'SiamMask', video['name'])
+    #     if not isdir(video_path): makedirs(video_path)
+    #     pred_mask_final = np.array(pred_masks)
+    #     pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
+    #             np.max(pred_mask_final, axis=0) > state['p'].seg_thr).astype('uint8')
+    #     for i in range(pred_mask_final.shape[0]):
+    #         pp = join(video_path, image_files[i].split('/')[-1].split('.')[0] + '.png')
+    #         cv2.imwrite(pp, pred_mask_final[i].astype(np.uint8))
+
+    if True:
+        video_path = join('test', args.dataset, 'vis', video['name'])
         if not isdir(video_path): makedirs(video_path)
         pred_mask_final = np.array(pred_masks)
         pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
                 np.max(pred_mask_final, axis=0) > state['p'].seg_thr).astype('uint8')
-        for i in range(pred_mask_final.shape[0]):
-            cv2.imwrite(join(video_path, image_files[i].split('/')[-1].split('.')[0] + '.png'), pred_mask_final[i].astype(np.uint8))
+        colors = []
+        for track_id in object_ids:
+            color = create_unique_color_uchar(track_id)
+            colors.append(color)
+        colors = np.array(colors)
+        # COLORS = np.random.randint(128, 255, size=(object_num, 3), dtype="uint8")
+        colors = np.vstack([[0, 0, 0], colors]).astype("uint8")
+        mask = colors[pred_mask_final]
 
-    if args.visualization:
-        pred_mask_final = np.array(pred_masks)
-        pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
-                np.max(pred_mask_final, axis=0) > state['p'].seg_thr).astype('uint8')
-        COLORS = np.random.randint(128, 255, size=(object_num, 3), dtype="uint8")
-        COLORS = np.vstack([[0, 0, 0], COLORS]).astype("uint8")
-        mask = COLORS[pred_mask_final]
-        for f, image_file in enumerate(image_files):
-            output = ((0.4 * cv2.imread(image_file)) + (0.6 * mask[f,:,:,:])).astype("uint8")
-            cv2.imshow("mask", output)
+        frames = []
+        for f, image_file in tqdm(enumerate(image_files)):
+            output = ((0.4 * cv2.imread(image_file)) + (0.6 * mask[f, :, :, :])).astype("uint8")
+            pp = join(video_path, image_file.split('/')[-1].split('.')[0] + '.png')
+            if f > 0:
+                for track_id, locations in locations_objs:
+                    if f in locations:
+                        location = locations[f]
+                        color = create_unique_color_uchar(track_id)
+                        # cv2.polylines(output, [np.int0(location).reshape((-1, 1, 2))], True, color, 3)
+#                         xmin = xmax = location[0]
+#                         ymin = ymax = location[1]
+#                         for i in range(2, 8, 2):
+#                             if location[i] > xmax:
+#                                 xmax = location[i]
+#                             if location[i] < xmin:
+#                                 xmin = location[i]
+#                         for i in range(3, 8, 2):
+#                             if location[i] > ymax:
+#                                 ymax = location[i]
+#                             if location[i] < ymin:
+#                                 ymin = location[i]
+                        draw_rectangle(output, color, *location, label=str(track_id))
+            cv2.imwrite(pp, output)
+            copy_output = np.ascontiguousarray(np.copy(output), dtype=np.uint8)
+            frames.append(copy_output)
+            # cv2.imshow("mask", output)
             cv2.waitKey(1)
 
-    logger.info('({:d}) Video: {:12s} Time: {:02.1f}s Speed: {:3.1f}fps'.format(
-        v_id, video['name'], toc, f*len(object_ids) / toc))
+        clip = mpe.ImageSequenceClip(frames, fps=10)
+        clip.write_videofile(join(video_path, video['name'] + '.avi'), codec='png')
 
-    return multi_mean_iou, f*len(object_ids) / toc
+    logger.info('({:d}) Video: {:12s} Time: {:02.1f}s Speed: {:3.1f}fps'.format(
+        v_id, video['name'], toc, f * len(object_ids) / toc))
+
+    return multi_mean_iou, f * len(object_ids) / toc
 
 
 def main():
@@ -579,8 +717,10 @@ def main():
     for v_id, video in enumerate(dataset.keys(), start=1):
         if vos_enable:
             iou_list, speed = track_vos(model, dataset[video], cfg['hp'] if 'hp' in cfg.keys() else None,
-                                 args.mask, args.refine, args.dataset in ['DAVIS2017', 'ytb_vos'])
+                                 args.mask, args.refine, args.dataset in ['DAVIS2017', 'ytb_vos'], is_av=True)
             iou_lists.append(iou_list)
+            speed_list.append(speed)
+            break
         else:
             lost, speed = track_vot(model, dataset[video], cfg['hp'] if 'hp' in cfg.keys() else None,
                              args.mask, args.refine)

@@ -25,6 +25,7 @@ def get_dataset_zoo():
                or exists(join(y, 'ImageSets', '2016', 'val.txt'))
 
     zoos = list(filter(valid, zoos))
+    print(root)
     return zoos
 
 
@@ -56,7 +57,7 @@ def load_dataset(dataset):
             info[video] = {'image_files': image_files, 'gt': gt, 'name': video}
     elif 'DAVIS' in dataset:
         base_path = join(realpath(dirname(__file__)), '../data', 'DAVIS')
-        list_path = join(realpath(dirname(__file__)), '../data', 'DAVIS', 'ImageSets', dataset[-4:], 'val.txt')
+        list_path = join(realpath(dirname(__file__)), '../data', 'DAVIS', 'ImageSets', dataset[-4:], 'test-dev.txt')
         with open(list_path) as f:
             videos = [v.strip() for v in f.readlines()]
         for video in videos:
