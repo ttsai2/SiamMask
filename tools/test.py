@@ -28,7 +28,7 @@ from utils.tracker_config import TrackerConfig
 import colorsys
 from utils.config_helper import load_config
 from utils.pyvotkit.region import vot_overlap, vot_float2str
-
+import pickle
 thrs = np.arange(0.3, 0.5, 0.05)
 
 model_zoo = sorted(name for name in models.__dict__
@@ -80,6 +80,56 @@ def bbox1(img):
     a = np.where(img != 0)
     bbox = np.min(a[1]), np.min(a[0]), np.max(a[1]), np.max(a[0])
     return bbox
+
+def get_iou(bb1, bb2):
+    """
+    Calculate the Intersection over Union (IoU) of two bounding boxes.
+
+    Parameters
+    ----------
+    bb1 : dict
+        Keys: {'x1', 'x2', 'y1', 'y2'}
+        The (x1, y1) position is at the top left corner,
+        the (x2, y2) position is at the bottom right corner
+    bb2 : dict
+        Keys: {'x1', 'x2', 'y1', 'y2'}
+        The (x, y) position is at the top left corner,
+        the (x2, y2) position is at the bottom right corner
+
+    Returns
+    -------
+    float
+        in [0, 1]
+    """
+    assert bb1['x1'] < bb1['x2']
+    assert bb1['y1'] < bb1['y2']
+    assert bb2['x1'] < bb2['x2']
+    assert bb2['y1'] < bb2['y2']
+
+    # determine the coordinates of the intersection rectangle
+    x_left = max(bb1['x1'], bb2['x1'])
+    y_top = max(bb1['y1'], bb2['y1'])
+    x_right = min(bb1['x2'], bb2['x2'])
+    y_bottom = min(bb1['y2'], bb2['y2'])
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    # The intersection of two axis-aligned bounding boxes is always an
+    # axis-aligned bounding box
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+    # compute the area of both AABBs
+    bb1_area = (bb1['x2'] - bb1['x1']) * (bb1['y2'] - bb1['y1'])
+    bb2_area = (bb2['x2'] - bb2['x1']) * (bb2['y2'] - bb2['y1'])
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = intersection_area / float(bb1_area + bb2_area - intersection_area)
+    assert iou >= 0.0
+    assert iou <= 1.0
+    return iou
 
 def to_torch(ndarray):
     if type(ndarray).__module__ == 'numpy':
@@ -521,8 +571,118 @@ def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot
             i += 1
         object_ids = [1,2,3,7,8,11,15,25,31,36,46,64,70,81,85,88,95,98,102]
         object_num = len(object_ids)
-        pred_masks = np.zeros((object_num, len(image_files), 1024, 1224)) - 1
+        pred_masks = {}
+        # pred_masks = np.zeros((len(image_files), 1024, 1224)) - 1
         init_bbox = [[488, 552, 551, 596], [716, 549, 820, 625], [320, 557, 359, 584], [680, 543, 737, 594], [573, 547, 612, 573],[717, 545, 796, 607], [481, 540, 546, 567], [237, 549, 304, 575], [39, 518, 189, 579], [755, 536, 824, 562], [824, 532, 836, 569], [928, 527, 954, 593], [1051, 527, 1098, 638], [5, 555, 269, 855], [462, 541, 505, 568], [236, 551, 308, 588], [90, 556, 214, 606], [423, 547, 477, 577], [1186, 512, 1223, 675]]
+
+        # locations_objs = []
+        all_bboxes = []
+        next_track_id = 1
+        alive_tracks = {}
+        dead_tracks = {}
+        seg_thr = 0.35 # for DAVIS
+
+        toc = 0
+
+        def match_IOU(bboxes, target):
+            for track_id, bbox in bboxes:
+                iou = get_iou({'x1': bbox[0], 'x2': bbox[2], 'y1': bbox[1], 'y2': bbox[3]},
+                        {'x1': target[0], 'x2': target[2], 'y1': target[1], 'y2': target[3]})
+                if iou > 0.4:
+                    return True
+            return False
+
+        with open('detectron_result_15s', 'rb') as fp:
+            detectron_result = pickle.load(fp)
+        detectron_result = list(map(lambda r: r['bboxes'], detectron_result))
+
+        for f, image_file in enumerate(image_files):
+            image = cv2.imread(image_file)
+            detections = detectron_result[f]
+
+            current_bboxes = []
+            all_bboxes.append(current_bboxes)
+            to_delete = []
+            # update current tracks
+            for track_id, states in alive_tracks.items():
+                tic = cv2.getTickCount()
+                new_state = siamese_track(states[-1][1], image, mask_enable, refine_enable)  # track
+                toc += cv2.getTickCount() - tic
+                mask = new_state['mask']
+                if new_state['best_pscore'] < .80:
+                    print("track: {} stops at frame: {:3d}, score: {:3.4f}".format(track_id, f, new_state['best_pscore']))
+                    to_delete.append(track_id)
+                    dead_tracks[track_id] = states
+                else:
+                    print("track: {}, frame: {:3d}, score: {:3.4f}".format(track_id, f, new_state['best_pscore']))
+                    # location = state['ploygon'].flatten()
+                    # locations[f] = location
+                    states.append((f, new_state))
+                    current_bboxes.append((track_id, new_state['bbox']))
+                    if track_id in pred_masks:
+                        pred_mask = pred_masks[track_id]
+                    else:
+                        pred_mask = np.zeros((len(image_files), 1024, 1224)) - 1
+                    pred_mask[f, :, :] = mask
+                    pred_masks[track_id] = pred_mask
+            for track_id in to_delete:
+                del alive_tracks[track_id]
+            # new tracks
+            for detection in detections:
+                bbox = detection
+                if not match_IOU(current_bboxes, bbox):
+                    track_id = next_track_id
+                    current_bboxes.append((track_id, bbox))
+
+                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    target_pos = np.array([cx, cy])
+                    target_sz = np.array([w, h])
+                    tic = cv2.getTickCount()
+                    new_state = siamese_init(image, target_pos, target_sz, model, hp)  # init tracker
+                    toc += cv2.getTickCount() - tic
+                    new_states = [(f, new_state)]
+                    alive_tracks[next_track_id] = new_states
+                    next_track_id += 1
+
+        toc /= cv2.getTickFrequency()
+
+        video_path = join('test', args.dataset, 'vis', video['name'])
+        if not isdir(video_path): makedirs(video_path)
+        num_tracks = next_track_id - 1
+        pred_mask_final = np.array([pred_masks[track_id] for track_id in range(1, num_tracks + 1)])
+        pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
+                np.max(pred_mask_final, axis=0) > seg_thr).astype('uint8')
+        colors = []
+        for track_id in range(1, num_tracks + 1):
+            color = create_unique_color_uchar(track_id)
+            colors.append(color)
+        colors = np.array(colors)
+        # COLORS = np.random.randint(128, 255, size=(object_num, 3), dtype="uint8")
+        colors = np.vstack([[0, 0, 0], colors]).astype("uint8")
+        mask = colors[pred_mask_final]
+
+        frames = []
+        for f, image_file in tqdm(enumerate(image_files)):
+            output = ((0.4 * cv2.imread(image_file)) + (0.6 * mask[f, :, :, :])).astype("uint8")
+            pp = join(video_path, image_file.split('/')[-1].split('.')[0] + '.png')
+            # if f > 0:
+            for track_id, locations in all_bboxes[f]:
+                location = locations[f]
+                color = create_unique_color_uchar(track_id)
+                draw_rectangle(output, color, *location, label=str(track_id))
+            cv2.imwrite(pp, output)
+            copy_output = np.ascontiguousarray(np.copy(output), dtype=np.uint8)
+            frames.append(copy_output)
+            # cv2.imshow("mask", output)
+            cv2.waitKey(1)
+
+        clip = mpe.ImageSequenceClip(frames, fps=10)
+        clip.write_videofile(join(video_path, video['name'] + '.avi'), codec='png')
+
+        multi_mean_iou = []
+        object_ids = range(1, num_tracks + 1)
+
     else:
         image_files = video['image_files']
 
@@ -545,37 +705,37 @@ def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot
         object_num = len(object_ids)
         pred_masks = np.zeros((object_num, len(image_files), annos[0].shape[0], annos[0].shape[1])) - 1
 
-    toc = 0
-    locations_objs = []
-    for obj_id, o_id in enumerate(object_ids):
-        mask = None
-        locations = {}
-        locations_objs.append((o_id, locations))
-        if 'start_frame' in video:
-            start_frame = video['start_frame'][str(o_id)]
-            end_frame = video['end_frame'][str(o_id)]
-        elif 'start_image_name' in video:
-            start_image_name = video['start_image_name'][o_id]
-#             end_image_name = video['end_image_name'][o_id]
-            start_frame = image_names_dict[start_image_name]
-#             end_frame = image_names_dict[end_image_name]
-            end_frame = len(image_files)
-        else:
-            start_frame, end_frame = 0, len(image_files)
+        toc = 0
+        locations_objs = []
+        for obj_id, o_id in enumerate(object_ids):
+            mask = None
+            locations = {}
+            locations_objs.append((o_id, locations))
+            if 'start_frame' in video:
+                start_frame = video['start_frame'][str(o_id)]
+                end_frame = video['end_frame'][str(o_id)]
+            elif 'start_image_name' in video:
+                # start_image_name = video['start_image_name'][o_id]
+    #             end_image_name = video['end_image_name'][o_id]
+    #             start_frame = image_names_dict[start_image_name]
+    #             end_frame = image_names_dict[end_image_name]
+                end_frame = len(image_files)
+            else:
+                start_frame, end_frame = 0, len(image_files)
 
-        track_stop = False
-        for f, image_file in enumerate(image_files):
-            tic = cv2.getTickCount()
-            if f == start_frame:  # init
-                im = cv2.imread(image_file)
-                if is_av:
-                    bbox = init_bbox[obj_id]
-                    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-                    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                    target_pos = np.array([cx, cy])
-                    target_sz = np.array([w, h])
-                    state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
-                else:
+            track_stop = False
+            for f, image_file in enumerate(image_files):
+                tic = cv2.getTickCount()
+                if f == start_frame:  # init
+                    im = cv2.imread(image_file)
+                    # if is_av:
+                    #     bbox = init_bbox[obj_id]
+                    #     cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                    #     w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    #     target_pos = np.array([cx, cy])
+                    #     target_sz = np.array([w, h])
+                    #     state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
+                    # else:
                     mask = annos_init[obj_id] == o_id
                     x, y, w, h = cv2.boundingRect((mask).astype(np.uint8))
                     cx, cy = x + w / 2, y + h / 2
@@ -583,35 +743,35 @@ def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot
                     target_sz = np.array([w, h])
                     state = siamese_init(im, target_pos, target_sz, model, hp)  # init tracker
                     #                 location = state['ploygon'].flatten()
-            elif end_frame >= f > start_frame:  # tracking
-                if not track_stop:
-                    im = cv2.imread(image_file)
-                    state = siamese_track(state, im, mask_enable, refine_enable)  # track
-                    mask = state['mask']
-                    if state['best_pscore'] < .80:
-                        print("track: {} stops at frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
-                        track_stop = True
-                    else:
-                        print("track: {}, frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
-                        # location = state['ploygon'].flatten()
-                        # locations[f] = location
-                        locations[f] = state['bbox']
-            toc += cv2.getTickCount() - tic
-            if end_frame >= f > start_frame and not track_stop:
-                pred_masks[obj_id, f, :, :] = mask
-    toc /= cv2.getTickFrequency()
+                elif end_frame >= f > start_frame:  # tracking
+                    if not track_stop:
+                        im = cv2.imread(image_file)
+                        state = siamese_track(state, im, mask_enable, refine_enable)  # track
+                        mask = state['mask']
+                        if state['best_pscore'] < .80:
+                            print("track: {} stops at frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
+                            track_stop = True
+                        else:
+                            print("track: {}, frame: {:3d}, score: {:3.4f}".format(o_id, f, state['best_pscore']))
+                            # location = state['ploygon'].flatten()
+                            # locations[f] = location
+                            locations[f] = state['bbox']
+                toc += cv2.getTickCount() - tic
+                if end_frame >= f > start_frame and not track_stop:
+                    pred_masks[obj_id, f, :, :] = mask
+        toc /= cv2.getTickFrequency()
 
-#     if len(annos) == len(image_files):
-#         multi_mean_iou = MultiBatchIouMeter(thrs, pred_masks, annos,
-#                                             start=video['start_frame'] if 'start_frame' in video else None,
-#                                             end=video['end_frame'] if 'end_frame' in video else None)
-#         for i in range(object_num):
-#             for j, thr in enumerate(thrs):
-#                 logger.info('Fusion Multi Object{:20s} IOU at {:.2f}: {:.4f}'.format(video['name'] + '_' + str(i + 1), thr,
-#                                                         multi_mean_iou[i, j]))
-#     else:
-#         multi_mean_iou = []
-    multi_mean_iou = []
+    #     if len(annos) == len(image_files):
+    #         multi_mean_iou = MultiBatchIouMeter(thrs, pred_masks, annos,
+    #                                             start=video['start_frame'] if 'start_frame' in video else None,
+    #                                             end=video['end_frame'] if 'end_frame' in video else None)
+    #         for i in range(object_num):
+    #             for j, thr in enumerate(thrs):
+    #                 logger.info('Fusion Multi Object{:20s} IOU at {:.2f}: {:.4f}'.format(video['name'] + '_' + str(i + 1), thr,
+    #                                                         multi_mean_iou[i, j]))
+    #     else:
+    #         multi_mean_iou = []
+        multi_mean_iou = []
 
     # if False:
     #     video_path = join('test', args.dataset, 'SiamMask', video['name'])
@@ -623,55 +783,55 @@ def track_vos(model, video, hp=None, mask_enable=False, refine_enable=False, mot
     #         pp = join(video_path, image_files[i].split('/')[-1].split('.')[0] + '.png')
     #         cv2.imwrite(pp, pred_mask_final[i].astype(np.uint8))
 
-    if True:
-        video_path = join('test', args.dataset, 'vis', video['name'])
-        if not isdir(video_path): makedirs(video_path)
-        pred_mask_final = np.array(pred_masks)
-        pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
-                np.max(pred_mask_final, axis=0) > state['p'].seg_thr).astype('uint8')
-        colors = []
-        for track_id in object_ids:
-            color = create_unique_color_uchar(track_id)
-            colors.append(color)
-        colors = np.array(colors)
-        # COLORS = np.random.randint(128, 255, size=(object_num, 3), dtype="uint8")
-        colors = np.vstack([[0, 0, 0], colors]).astype("uint8")
-        mask = colors[pred_mask_final]
+        if True:
+            video_path = join('test', args.dataset, 'vis', video['name'])
+            if not isdir(video_path): makedirs(video_path)
+            pred_mask_final = np.array(pred_masks)
+            pred_mask_final = (np.argmax(pred_mask_final, axis=0).astype('uint8') + 1) * (
+                    np.max(pred_mask_final, axis=0) > state['p'].seg_thr).astype('uint8')
+            colors = []
+            for track_id in object_ids:
+                color = create_unique_color_uchar(track_id)
+                colors.append(color)
+            colors = np.array(colors)
+            # COLORS = np.random.randint(128, 255, size=(object_num, 3), dtype="uint8")
+            colors = np.vstack([[0, 0, 0], colors]).astype("uint8")
+            mask = colors[pred_mask_final]
 
-        frames = []
-        for f, image_file in tqdm(enumerate(image_files)):
-            output = ((0.4 * cv2.imread(image_file)) + (0.6 * mask[f, :, :, :])).astype("uint8")
-            pp = join(video_path, image_file.split('/')[-1].split('.')[0] + '.png')
-            if f > 0:
+            frames = []
+            for f, image_file in tqdm(enumerate(image_files)):
+                output = ((0.4 * cv2.imread(image_file)) + (0.6 * mask[f, :, :, :])).astype("uint8")
+                pp = join(video_path, image_file.split('/')[-1].split('.')[0] + '.png')
+                # if f > 0:
                 for track_id, locations in locations_objs:
                     if f in locations:
                         location = locations[f]
                         color = create_unique_color_uchar(track_id)
                         # cv2.polylines(output, [np.int0(location).reshape((-1, 1, 2))], True, color, 3)
-#                         xmin = xmax = location[0]
-#                         ymin = ymax = location[1]
-#                         for i in range(2, 8, 2):
-#                             if location[i] > xmax:
-#                                 xmax = location[i]
-#                             if location[i] < xmin:
-#                                 xmin = location[i]
-#                         for i in range(3, 8, 2):
-#                             if location[i] > ymax:
-#                                 ymax = location[i]
-#                             if location[i] < ymin:
-#                                 ymin = location[i]
+    #                         xmin = xmax = location[0]
+    #                         ymin = ymax = location[1]
+    #                         for i in range(2, 8, 2):
+    #                             if location[i] > xmax:
+    #                                 xmax = location[i]
+    #                             if location[i] < xmin:
+    #                                 xmin = location[i]
+    #                         for i in range(3, 8, 2):
+    #                             if location[i] > ymax:
+    #                                 ymax = location[i]
+    #                             if location[i] < ymin:
+    #                                 ymin = location[i]
                         draw_rectangle(output, color, *location, label=str(track_id))
-            cv2.imwrite(pp, output)
-            copy_output = np.ascontiguousarray(np.copy(output), dtype=np.uint8)
-            frames.append(copy_output)
-            # cv2.imshow("mask", output)
-            cv2.waitKey(1)
+                cv2.imwrite(pp, output)
+                copy_output = np.ascontiguousarray(np.copy(output), dtype=np.uint8)
+                frames.append(copy_output)
+                # cv2.imshow("mask", output)
+                cv2.waitKey(1)
 
-        clip = mpe.ImageSequenceClip(frames, fps=10)
-        clip.write_videofile(join(video_path, video['name'] + '.avi'), codec='png')
+            clip = mpe.ImageSequenceClip(frames, fps=10)
+            clip.write_videofile(join(video_path, video['name'] + '.avi'), codec='png')
 
-    logger.info('({:d}) Video: {:12s} Time: {:02.1f}s Speed: {:3.1f}fps'.format(
-        v_id, video['name'], toc, f * len(object_ids) / toc))
+        logger.info('({:d}) Video: {:12s} Time: {:02.1f}s Speed: {:3.1f}fps'.format(
+            v_id, video['name'], toc, f * len(object_ids) / toc))
 
     return multi_mean_iou, f * len(object_ids) / toc
 
